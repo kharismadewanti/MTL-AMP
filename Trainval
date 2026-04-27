@@ -1,0 +1,450 @@
+import os
+import time
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+from torch import cat
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import models, transforms
+from torchsummary import summary
+from torchviz import make_dot
+from matplotlib import pyplot as plt
+from tqdm.auto import tqdm
+from collections import OrderedDict
+from torchvision.models import ResNet50_Weights
+from torch.amp import autocast, GradScaler
+ 
+
+class ConvBNRelu(nn.Module):
+    def __init__(self, channelx, stridex=1, kernelx=3, paddingx=1, dropout_p=0.1):
+        super(ConvBNRelu, self).__init__()
+        self.conv = nn.Conv2d(
+            channelx[0], channelx[1], kernel_size=kernelx,
+            stride=stridex, padding=paddingx, padding_mode="zeros",
+        )
+        self.bn = nn.BatchNorm2d(channelx[1])
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout2d(p=dropout_p)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return x
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, channel, final=False):
+        super(ConvBlock, self).__init__()
+        if final:
+            # keep size, then project with 1x1
+            self.conv_block0 = ConvBNRelu(channelx=[channel[0], channel[0]], stridex=1)
+            self.conv_block1 = nn.Conv2d(channel[0], channel[1], kernel_size=1)
+        else:
+            self.conv_block0 = ConvBNRelu(channelx=[channel[0], channel[1]], stridex=1)
+            self.conv_block1 = ConvBNRelu(channelx=[channel[1], channel[1]], stridex=1)
+
+    def forward(self, x):
+        y = self.conv_block0(x)
+        y = self.conv_block1(y)
+        return y
+
+
+class resnet50mtlfp16(nn.Module):
+    def __init__(self):
+        super().__init__()
+        n_fmap = [64, 256, 512, 1024, 2048]
+
+        # RGB normalizer expects input in [0,1]
+        self.rgb_normalizer = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        self.RGB_encoder = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.RGB_encoder.fc = nn.Sequential()
+        self.RGB_encoder.avgpool = nn.Sequential()
+
+        # SEG decoder
+        self.conv3_ss_f = ConvBlock(channel=[n_fmap[4] + n_fmap[3], n_fmap[3]])
+        self.conv2_ss_f = ConvBlock(channel=[n_fmap[3] + n_fmap[2], n_fmap[2]])
+        self.conv1_ss_f = ConvBlock(channel=[n_fmap[2] + n_fmap[1], n_fmap[1]])
+        self.conv0_ss_f = ConvBlock(channel=[n_fmap[1] + n_fmap[0], n_fmap[0]])
+        self.final_ss_f = ConvBlock(channel=[n_fmap[0], 19], final=True)
+
+        # DEPTH decoder
+        self.conv3_dep_f = ConvBlock(channel=[n_fmap[4] + n_fmap[3], n_fmap[3]])
+        self.conv2_dep_f = ConvBlock(channel=[n_fmap[3] + n_fmap[2], n_fmap[2]])
+        self.conv1_dep_f = ConvBlock(channel=[n_fmap[2] + n_fmap[1], n_fmap[1]])
+        self.conv0_dep_f = ConvBlock(channel=[n_fmap[1] + n_fmap[0], n_fmap[0]])
+        self.final_dep_f = ConvBlock(channel=[n_fmap[0], 1], final=True)
+
+        #self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, rgb):
+        # Expect rgb in [0,1]
+        rgb = rgb.float()
+        in_rgb = self.rgb_normalizer(rgb)
+        x_RGB = self.RGB_encoder.conv1(in_rgb)
+        x_RGB = self.RGB_encoder.bn1(x_RGB)
+        feat0 = self.RGB_encoder.relu(x_RGB)               
+        feat1 = self.RGB_encoder.layer1(self.RGB_encoder.maxpool(feat0))  
+        feat2 = self.RGB_encoder.layer2(feat1)         
+        feat3 = self.RGB_encoder.layer3(feat2)        
+        feat4 = self.RGB_encoder.layer4(feat3)         
+        up_feat4 = F.interpolate(feat4, size=feat3.size()[-2:], mode="bilinear", align_corners=True)
+
+        # SEG path
+        s3 = self.conv3_ss_f(cat([up_feat4, feat3], dim=1))
+        s3u = F.interpolate(s3, size=feat2.shape[-2:], mode="bilinear", align_corners=True)
+        s2 = self.conv2_ss_f(cat([s3u, feat2], dim=1))
+        s2u = F.interpolate(s2, size=feat1.shape[-2:], mode="bilinear", align_corners=True)
+        s1 = self.conv1_ss_f(cat([s2u, feat1], dim=1))
+        s1u = F.interpolate(s1, size=feat0.shape[-2:], mode="bilinear", align_corners=True)
+        s0 = self.conv0_ss_f(cat([s1u, feat0], dim=1))
+        s0u = F.interpolate(s0, size=in_rgb.size()[-2:], mode="bilinear", align_corners=True)
+        seg_f = self.final_ss_f(s0u)  # multi-label style; keep BCE
+
+        # DEPTH path
+        d3 = self.conv3_dep_f(cat([up_feat4, feat3], dim=1))
+        d3u = F.interpolate(d3, size=feat2.size()[-2:], mode="bilinear", align_corners=True)
+        d2 = self.conv2_dep_f(cat([d3u, feat2], dim=1))
+        d2u = F.interpolate(d2, size=feat1.size()[-2:], mode="bilinear", align_corners=True)
+        d1 = self.conv1_dep_f(cat([d2u, feat1], dim=1))
+        d1u = F.interpolate(d1, size=feat0.size()[-2:], mode="bilinear", align_corners=True)
+        d0 = self.conv0_dep_f(cat([d1u, feat0], dim=1))
+        d0u = F.interpolate(d0, size=in_rgb.size()[-2:], mode="bilinear", align_corners=True)
+        dep_f = self.relu(self.final_dep_f(d0u))
+
+        return seg_f, dep_f
+
+
+SEG_MAP = {
+    'colors': [
+        [128, 64, 128],[244, 35, 232],[70, 70, 70],[102, 102, 156],[190, 153, 153],[153, 153, 153],[250, 170, 30],[220, 220, 0],[107, 142, 35],
+        [152, 251, 152],[70, 130, 180],[220, 20, 60],[255, 0, 0],[0, 0, 142],
+        [0, 0, 70],[0, 60, 100],[0, 80, 100],[0, 0, 230],[119, 11, 32],
+    ],
+    'classes': [
+        'road','sidewalk','building','wall','fence','pole','traffic light','traffic sign','vegetation',
+        'terrain','sky','person','rider','car','truck','bus','train','motorcycle','bicycle'
+    ],
+}
+
+
+def cls2one_hot(ss_gt19, n_class):
+    one_hot = (np.arange(n_class) == ss_gt19[..., None]).astype(np.float32)
+    return one_hot
+
+
+def resize_matrix(image, target_size=(256, 512)):
+    resized_image = cv2.resize(image, (target_size[1], target_size[0]), interpolation=cv2.INTER_NEAREST)
+    return resized_image
+
+
+class myData(Dataset):
+    def __init__(self, root_dir, part):
+        self.rgb = []
+        self.seg = []
+        self.dep = []
+
+        rgb_folder = os.path.join(root_dir, 'rgb', part)
+        seg_folder = os.path.join(root_dir, 'seg', part)
+        dep_folder = os.path.join(root_dir, 'dep', part)
+
+        town_list = os.listdir(rgb_folder)
+        town_list.sort()
+        for town in town_list:
+            rgb_dir = os.path.join(rgb_folder, town)
+            seg_dir = os.path.join(seg_folder, town)
+            dep_dir = os.path.join(dep_folder, town)
+
+            file_list = os.listdir(rgb_dir)
+            file_list.sort()
+            for filename in file_list:
+                self.rgb.append(os.path.join(rgb_dir, filename))
+                self.seg.append(os.path.join(seg_dir, filename[:-4] + "_map.png"))
+                self.dep.append(os.path.join(dep_dir, filename[:-4] + ".png"))
+
+    def __len__(self):
+        return len(self.rgb)
+
+    def __getitem__(self, index):
+        data = dict()
+        rgb = cv2.imread(self.rgb[index])
+        rgb = resize_matrix(rgb, target_size=(256,512))
+        rgb = rgb.astype(np.float32)
+        data['rgb'] = np.transpose(rgb, (2, 0, 1))
+
+        segmap = cv2.imread(self.seg[index])[:, :, 0]
+        segmap = resize_matrix(segmap, target_size=(256, 512))
+        onehotcls = cls2one_hot(segmap, n_class=len(SEG_MAP["classes"]))
+        data['seg'] = np.transpose(onehotcls.astype(np.float32), (2, 0, 1))
+
+        dep = cv2.imread(self.dep[index], cv2.IMREAD_GRAYSCALE)
+        dep = resize_matrix(dep, target_size=(256,512))
+        dep = dep.astype(np.float32) / 255.0
+        data['dep'] = np.expand_dims(dep, axis=0)
+        return data
+
+
+def dice(pred, gt, smooth=1e-6):
+    pred = pred.view(pred.size(0), -1)
+    gt = gt.view(gt.size(0), -1)
+    inter = (pred * gt).sum(1)
+    union = pred.sum(1) + gt.sum(1)
+    dice = (2 * inter + smooth) / (union + smooth)
+    return (1 - dice).mean()
+
+
+class AverageMeter(object):
+    def __init__(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def vis_seg(seg, SEG_CMAP):
+    imgx = np.zeros((seg.shape[0], seg.shape[1], 3), dtype=np.uint32)
+    for cmap in SEG_CMAP['colors']:
+        cmap_id = SEG_CMAP['colors'].index(cmap)
+        rows, cols = np.where(seg == cmap_id)
+        imgx[rows, cols, :] = cmap
+    return imgx
+
+
+def lineardepth(normalized_depth):
+    lindep = np.clip(normalized_depth, 0.0, 1.0) * 255  # normalisasi ke 0 - 255
+    lindep = np.repeat(lindep[:, :, np.newaxis], 3, axis=2)
+    return lindep
+
+
+# Training & Validation
+def train(data_loader, model, writer, cur_epoch, device, optimizer, scaler):
+    model.train()
+    loss_total = AverageMeter()
+    loss_seg = AverageMeter()
+    loss_dep = AverageMeter()
+
+    prog_bar = tqdm()
+    prog_bar.reset(total=len(data_loader))
+
+    total_batch = len(data_loader)
+    batch_ke = 0
+    for data in data_loader:
+        cur_step = cur_epoch * total_batch + batch_ke
+
+        dep_gt = data['dep'].to(device, dtype=torch.float)
+        seg_gt = data['seg'].to(device, dtype=torch.float)
+        image = data['rgb'].to(device, dtype=torch.float)
+
+        with autocast("cuda"):
+            pred_seg, pred_dep = model(image)
+            bce_loss = F.binary_cross_entropy_with_logits(pred_seg, seg_gt)
+            dice_loss = dice(torch.sigmoid(pred_seg), seg_gt)
+            seg_loss_total = bce_loss + 2.0 * dice_loss
+            hb_loss = F.huber_loss(pred_dep, dep_gt, delta=1.0)
+            total_loss = 1.0 * seg_loss_total + 5.0 * hb_loss
+
+        optimizer.zero_grad()
+        scaler.scale(total_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        loss_total.update(total_loss.item())
+        loss_seg.update(seg_loss_total.item())
+        loss_dep.update(hb_loss.item())
+
+        postfix = OrderedDict([
+            ('train_loss_total', loss_total.avg),
+            ('train_loss_seg', loss_seg.avg),
+            ('train_loss_dep', loss_dep.avg),
+        ])
+
+        writer.add_scalar('train_loss_total', total_loss.item(), cur_step)
+        writer.add_scalar('train_loss_seg', bce_loss.item(), cur_step)
+        writer.add_scalar('train_loss_dep', hb_loss.item(), cur_step)
+
+        prog_bar.set_postfix(postfix)
+        prog_bar.update(1)
+        batch_ke += 1
+    prog_bar.refresh()
+    return postfix
+
+
+def validate(data_loader, model, writer, cur_epoch, device):
+    model.eval()
+    loss_total = AverageMeter()
+    loss_seg = AverageMeter()
+    loss_dep = AverageMeter()
+
+    with torch.no_grad():
+        prog_bar = tqdm(total=len(data_loader))
+
+        total_batch = len(data_loader)
+        batch_ke = 0
+        for data in data_loader:
+            cur_step = cur_epoch * total_batch + batch_ke
+
+            dep_gt = data['dep'].to(device, dtype=torch.float)
+            seg_gt = data['seg'].to(device, dtype=torch.float)
+            image = data['rgb'].to(device, dtype=torch.float)
+
+            with autocast("cuda"):
+                pred_seg, pred_dep = model(image)
+                bce_loss = F.binary_cross_entropy_with_logits(pred_seg, seg_gt.float())
+                dice_loss = dice(torch.sigmoid(pred_seg), seg_gt.float())
+                seg_loss_total = bce_loss + 2.0 * dice_loss
+                hb_loss = F.huber_loss(pred_dep, dep_gt, delta=1.0)
+                total_loss = 1.0 * seg_loss_total + 5.0 * hb_loss
+
+            loss_total.update(total_loss.item())
+            loss_seg.update(seg_loss_total.item())
+            loss_dep.update(hb_loss.item())
+
+            postfix = OrderedDict([
+                ('val_loss_total', loss_total.avg),
+                ('val_loss_seg', loss_seg.avg),
+                ('val_loss_dep', loss_dep.avg),
+            ])
+
+            writer.add_scalar('val_loss_total', total_loss.item(), cur_step)
+            writer.add_scalar('val_loss_seg', bce_loss.item(), cur_step)
+            writer.add_scalar('val_loss_dep', hb_loss.item(), cur_step)
+
+            prog_bar.set_postfix(postfix)
+            prog_bar.update()
+            batch_ke += 1
+        prog_bar.refresh()
+    return postfix
+
+
+def main():
+    model = resnet50mtlfp16()
+    optima = optim.Adam(model.parameters(), lr=2e-5, weight_decay=5e-4)
+    n_epoch = 50
+    scaler = GradScaler()
+    lr_sch = optim.lr_scheduler.CosineAnnealingLR(optima, T_max=n_epoch, eta_min=1e-5)
+
+    rootdir = '/media/esr/SSD4T/dataset_kharis_new'
+    train_set = myData(root_dir=rootdir, part='train')
+    val_set = myData(root_dir=rootdir, part='val')
+    print('Jumlah sample training:', len(train_set))
+    print('Jumlah sample validation:', len(val_set))
+    dataloader_train = DataLoader(train_set, batch_size=8, shuffle=True, num_workers=5, pin_memory=True)
+    dataloader_val = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=5, pin_memory=True)
+
+    save_dir = os.path.join(os.getcwd(), 'resnet50mtl_fp16_new')
+    os.makedirs(save_dir, exist_ok=True)
+    log = OrderedDict([
+        ('epoch', []),('best_model', []),('val_loss_total', []),('val_loss_seg', []),('val_loss_dep', []),
+        ('train_loss_total', []),('train_loss_seg', []),('train_loss_dep', []),('elapsed_time', []),
+        ])
+    writer = SummaryWriter(save_dir)
+
+
+    os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES']='0'
+
+    device = torch.device('cuda')
+
+    if torch.cuda.device_count() > 1:
+        print('Available GPU =', torch.cuda.device_count())
+        for i in range(torch.cuda.device_count()):
+            print(f'[{i}] {torch.cuda.get_device_name(i)}')
+        model = torch.nn.parallel.DataParallel(model)
+    else:
+        print('Available GPU =', torch.cuda.device_count())
+        print(torch.cuda.get_device_name())
+    model = model.to(device)
+
+    # Cek total size model
+    total_size_mb = sum(p.element_size() * p.nelement() for p in model.parameters()) / 1_000_000
+    print(f"Total size of the model: {total_size_mb:.2f} MB")
+
+
+    # Model graph
+    model_fp32 = resnet50mtlfp16().float().cpu()
+    state_dict = {k.replace("module.", ""): v for k, v in model.state_dict().items()}
+    model_fp32.load_state_dict(model.state_dict(), strict=False)
+    model_fp32.eval()
+
+    X_cpu = torch.zeros(1, 3, 256, 512, dtype=torch.float32)
+    with torch.no_grad():
+        Y_cpu = model_fp32(X_cpu)
+        graph = make_dot(Y_cpu[0])
+        graph.format = "png"
+        graph.render(os.path.join(save_dir, "model_graph"))
+
+        summary(model_fp32, input_size=(3, 256, 512), device="cpu")
+
+        writer.add_graph(model_fp32, X_cpu)
+
+    lowest_loss = float('inf')
+    init_stop_counter = 10
+    stop_count = init_stop_counter
+
+    for epoch in range(n_epoch):
+        print(f'Epoch: {epoch:05d}----------------------------------------------')
+        print('current lr untuk training: ', optima.param_groups[0]['lr'])
+
+        start_time = time.time()
+        train_log = train(dataloader_train, model, writer, epoch, device, optima, scaler)
+        val_log = validate(dataloader_val, model, writer, epoch, device)
+        lr_sch.step()
+
+        if val_log['val_loss_total'] < lowest_loss:
+            print(f"best model disave! {lowest_loss:.6f} -> {val_log['val_loss_total']:.6f}")
+            torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
+            lowest_loss = val_log["val_loss_total"]
+            stop_count = init_stop_counter
+        else:
+            stop_count -= 1
+            print(f'stop_count tersisa: {stop_count}')
+        if stop_count == 0: #early stopping
+            print("TRAINING BERHENTI KARENA TIDAK ADA PENURUNAN TOTAL LOSS DALAM %d EPOCH TERAKHIR" % (init_stop_counter))
+            break
+
+        elapsed_time = time.time() - start_time
+
+        log['epoch'].append(epoch)
+        log['val_loss_total'].append(val_log['val_loss_total'])
+        log['val_loss_seg'].append(val_log['val_loss_seg'])
+        log['val_loss_dep'].append(val_log['val_loss_dep'])
+        log['train_loss_total'].append(train_log['train_loss_total'])
+        log['train_loss_seg'].append(train_log['train_loss_seg'])
+        log['train_loss_dep'].append(train_log['train_loss_dep'])
+        log['elapsed_time'].append(elapsed_time)
+        log['best_model'].append(val_log['val_loss_total'] < lowest_loss)
+        pd.DataFrame(log).to_csv(os.path.join(save_dir, 'trainval_log.csv'), index=False)
+
+        #epoch += 1
+
+    torch.cuda.empty_cache()
+
+    # Plot curve
+    plt.figure()
+    plt.plot(log["train_loss_total"], label="Train")
+    plt.plot(log["val_loss_total"], label="Validation")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Curve")
+    plt.legend()
+    plt.savefig(os.path.join(save_dir, "training_curve.png"), bbox_inches="tight")
+    plt.close()
+
+if __name__ == "__main__":
+    main()
