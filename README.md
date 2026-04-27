@@ -4,6 +4,7 @@ This project implements a Multi-Task Learning (MTL) model that performs semantic
 This project implements a multi-task perception model that simultaneously performs:
 - Semantic Segmentation (19 classes)
 - Monocular Depth Estimation
+
 The model adopts a shared ResNet50 encoder with dual decoder branches and skip connections, enabling efficient feature sharing across tasks. To improve computational efficiency and reduce memory usage, training is performed using Automatic Mixed Precision (AMP).
 
 This project uses a private dataset and is not publicly available.
