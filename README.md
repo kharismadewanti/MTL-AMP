@@ -11,6 +11,7 @@ The dataset consists of:
 - RGB images
 - Semantic segmentation labels
 - Depth maps
+
 Each sample must have:
 - Corresponding RGB image
 - Segmentation map (*_map.png)
